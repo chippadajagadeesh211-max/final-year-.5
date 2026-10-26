@@ -33,7 +33,7 @@ def build_pdf_report(fos: float, category: str, risk: int, sensors: list[dict]) 
         ("TOPPADDING", (0, 0), (-1, -1), 10),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dce5e2")),
     ]))
-    story.extend([summary, Spacer(1, 18), Paragraph("Sensor summary", styles["Heading2"])])
+    story.extend([summary, Spacer(1, 18), Paragraph("Sensor summary · source unverified", styles["Heading2"])])
     readings = [["Instrument", "Latest reading"]] + [[item["name"], f"{item['value']} {item['unit']}"] for item in sensors]
     sensor_table = Table(readings, colWidths=[3.4 * inch, 3.35 * inch], repeatRows=1)
     sensor_table.setStyle(TableStyle([
@@ -44,7 +44,16 @@ def build_pdf_report(fos: float, category: str, risk: int, sensors: list[dict]) 
         ("TOPPADDING", (0, 0), (-1, -1), 7),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
     ]))
-    story.extend([sensor_table, Spacer(1, 18), Paragraph("Engineering interpretation", styles["Heading2"])])
+    story.extend([
+        sensor_table,
+        Spacer(1, 8),
+        Paragraph(
+            "Sensor readings are not source-verified and may include demonstration defaults; do not treat them as validated field observations.",
+            styles["BodyText"],
+        ),
+        Spacer(1, 12),
+        Paragraph("Engineering interpretation", styles["Heading2"]),
+    ])
     story.append(Paragraph(
         f"Current monitoring indicators suggest a {category.lower()} condition. Interpret rainfall, pore pressure and movement together with a site-specific geotechnical model and qualified engineering review.",
         styles["BodyText"],

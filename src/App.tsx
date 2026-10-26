@@ -10,8 +10,11 @@ import {
   Area, AreaChart, CartesianGrid, ComposedChart, Line, LineChart, ReferenceLine,
   ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import { Circle, MapContainer, TileLayer, Tooltip as MapTooltip } from 'react-leaflet'
+import { Circle, CircleMarker, MapContainer, TileLayer, Tooltip as MapTooltip, useMap, useMapEvents } from 'react-leaflet'
 import type { LucideIcon } from 'lucide-react'
+import { DataUploadPage, MlPredictionPage, ModelEvaluationPage } from './MlPredictionPage'
+import { apiUrl } from './mlPrediction'
+import type { PredictionRow } from './mlPrediction'
 
 type Page = 'Home' | 'Live Monitoring' | 'Slope Analysis' | 'Predictions' | 'History' | 'Sensors' | 'Alerts' | 'Data Upload' | 'AI Model' | 'Reports' | 'Settings'
 type Scenario = 'SAFE' | 'WARNING' | 'CRITICAL'
@@ -68,6 +71,41 @@ const sensorLocations: [string, number, number, string, string][] = [
 ]
 
 const initialInputs = { height: 18, angle: 34, cohesion: 24, friction: 31, unitWeight: 18.5, porePressure: 52, groundwater: 7.4, surcharge: 10, seismic: 0.05 }
+type PredictionLocation = { latitude: number; longitude: number; fos: number; riskClass: string; warning: string; row: number }
+type SelectedMapLocation = { latitude: number; longitude: number }
+type AnalysisResponse = {
+  fos: number
+  intermediate: {
+    normal_stress_kpa: number
+    effective_normal_stress_kpa: number
+    resisting_shear_kpa: number
+    driving_shear_kpa: number
+  }
+}
+
+function getPredictionField(row: PredictionRow, name: string): string | number | null | undefined {
+  const key = Object.keys(row).find((column) => column.trim().toLowerCase() === name)
+  return key ? row[key] : undefined
+}
+
+function PredictionMapBounds({ locations }: { locations: PredictionLocation[] }) {
+  const map = useMap()
+  useEffect(() => {
+    if (locations.length) {
+      map.fitBounds(locations.map(({ latitude, longitude }): [number, number] => [latitude, longitude]), { padding: [24, 24], maxZoom: 13 })
+    }
+  }, [locations, map])
+  return null
+}
+
+function MapLocationSelector({ onSelect }: { onSelect: (location: SelectedMapLocation) => void }) {
+  useMapEvents({
+    click(event) {
+      onSelect({ latitude: event.latlng.lat, longitude: event.latlng.lng })
+    },
+  })
+  return null
+}
 const descriptions: Record<Page, string> = {
   Home: 'Here’s the current condition of your monitored slope.',
   'Live Monitoring': 'Watch how the slope responds to changing environmental conditions.',
@@ -76,8 +114,8 @@ const descriptions: Record<Page, string> = {
   History: 'Review how this slope has behaved over time.',
   Sensors: 'Check the health and latest readings from each monitoring point.',
   Alerts: 'A clear record of conditions that may need an engineer’s attention.',
-  'Data Upload': 'Upload historical sensor observations to analyse your slope.',
-  'AI Model': 'A transparent look at how time-series patterns inform future estimates.',
+  'Data Upload': 'Upload a complete feature CSV to predict factor of safety and risk class for every row.',
+  'AI Model': 'Review held-out model metrics, selected algorithms and prototype limitations.',
   Reports: 'Prepare a concise engineering summary for your project review.',
   Settings: 'Adjust the monitoring context and project preferences.',
 }
@@ -111,9 +149,8 @@ function App() {
   const [calculation, setCalculation] = useState<ReturnType<typeof calcFos> | null>(null)
   const [mapStyle, setMapStyle] = useState<'Standard' | 'Terrain' | 'Satellite'>('Standard')
   const [selectedSensor, setSelectedSensor] = useState<string | null>(null)
-  const [fileResult, setFileResult] = useState<{ name: string; records: number; missing: number; columns: string[]; error: string } | null>(null)
-  const [uploadedFile, setUploadedFile] = useState<File | null>(null)
-  const [uploading, setUploading] = useState(false)
+  const [predictionLocations, setPredictionLocations] = useState<PredictionLocation[]>([])
+  const [selectedMapLocation, setSelectedMapLocation] = useState<SelectedMapLocation | null>(null)
   const [demoData, setDemoData] = useState(true)
   const [apiOnline, setApiOnline] = useState(false)
   const [toast, setToast] = useState('')
@@ -123,7 +160,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([fetch('http://localhost:8000/api/dashboard'), fetch('http://localhost:8000/api/sensors')])
+    Promise.all([fetch(apiUrl('/api/dashboard')), fetch(apiUrl('/api/sensors'))])
       .then(async ([dashboardResponse, sensorResponse]) => {
         if (!dashboardResponse.ok || !sensorResponse.ok) return
         const dashboard = await dashboardResponse.json()
@@ -154,7 +191,7 @@ function App() {
         return { ...sensor, value: Number(next.toFixed(index < 3 ? 1 : 2)), values: [...sensor.values.slice(1), next] }
       }))
       setFos((current) => Math.max(0.72, Math.min(3.3, current + (scenario === 'SAFE' ? 0.006 : scenario === 'WARNING' ? -0.025 : -0.06))))
-      void fetch('http://localhost:8000/api/simulation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scenario, step: nextTick }) })
+      void fetch(apiUrl('/api/simulation'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scenario, step: nextTick }) })
         .then((response) => response.ok ? response.json() : null)
         .then((result) => {
           if (!result) return
@@ -182,63 +219,32 @@ function App() {
   }
 
   async function recalculate() {
+    let usedLocalCalculation = false
     try {
-      const response = await fetch('http://localhost:8000/api/analysis', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(inputs) })
+      const response = await fetch(apiUrl('/api/analysis'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(inputs) })
       if (!response.ok) throw new Error('API unavailable')
-      const result = await response.json()
-      setFos(result.fos); setCalculation(result.intermediate)
+      const result = await response.json() as AnalysisResponse
+      setFos(result.fos)
+      setCalculation({
+        fos: result.fos,
+        normal: result.intermediate.normal_stress_kpa,
+        effective: result.intermediate.effective_normal_stress_kpa,
+        resistance: result.intermediate.resisting_shear_kpa,
+        driving: result.intermediate.driving_shear_kpa,
+      })
     } catch {
       const result = calcFos(inputs)
       setFos(result.fos); setCalculation(result)
+      usedLocalCalculation = true
     }
-    setToast('Stability assessment updated using the entered parameters.')
-  }
-
-  async function readCsv(file: File) {
-    setUploadedFile(file)
-    if (!file.name.toLowerCase().endsWith('.csv')) {
-      setFileResult({ name: file.name, records: 0, missing: 0, columns: [], error: 'Please choose a CSV file.' })
-      return
-    }
-    if (file.size > 20 * 1024 * 1024) {
-      setFileResult({ name: file.name, records: 0, missing: 0, columns: [], error: 'This file is larger than 20 MB. Please choose a smaller CSV.' })
-      return
-    }
-    const text = await file.text()
-    const rows = text.trim().split(/\r?\n/)
-    const columns = rows[0]?.split(',').map((column) => column.trim().toLowerCase()) ?? []
-    const required = ['timestamp', 'rainfall_mm', 'soil_moisture', 'pore_pressure_kpa', 'slope_movement_mm_day', 'gnss_displacement_mm', 'inclinometer_deg', 'groundwater_head_m']
-    const missingColumns = required.filter((column) => !columns.includes(column))
-    const emptyCells = rows.slice(1).filter((row) => row.split(',').some((cell) => !cell.trim())).length
-    const error = missingColumns.length ? `${missingColumns[0].replace(/_/g, ' ')} column is missing.` : ''
-    setFileResult({ name: file.name, records: Math.max(0, rows.length - 1), missing: emptyCells, columns, error })
-  }
-
-  async function analyzeCsv() {
-    if (!uploadedFile || fileResult?.error) return
-    setUploading(true)
-    const form = new FormData()
-    form.append('file', uploadedFile)
-    try {
-      const response = await fetch('http://localhost:8000/api/upload', { method: 'POST', body: form })
-      const result = await response.json()
-      if (!response.ok) {
-        setFileResult((current) => current ? { ...current, error: result.detail ?? 'We could not analyse this file. Check the CSV and try again.' } : current)
-        setToast(result.detail ?? 'We could not analyse this file. Check the CSV and try again.')
-        return
-      }
-      setDemoData(false)
-      setToast(`${result.readings_imported.toLocaleString()} monitoring readings imported from ${result.records.toLocaleString()} records.`)
-    } catch {
-      setToast('The CSV is valid, but the API is offline. Start FastAPI to import and analyse it.')
-    } finally {
-      setUploading(false)
-    }
+    setToast(usedLocalCalculation
+      ? 'API request failed; updated with the local simplified calculation.'
+      : 'Stability assessment updated using the backend calculation.')
   }
 
   async function refreshSensors() {
     try {
-      const response = await fetch('http://localhost:8000/api/sensors')
+      const response = await fetch(apiUrl('/api/sensors'))
       if (!response.ok) throw new Error('Reading service unavailable')
       const result = await response.json()
       setSensors((current) => current.map((sensor) => {
@@ -253,12 +259,14 @@ function App() {
 
   async function exportReport() {
     try {
-      const response = await fetch('http://localhost:8000/api/reports/pdf')
+      const response = await fetch(apiUrl('/api/reports/pdf'))
       if (!response.ok) throw new Error('PDF service unavailable')
       const link = document.createElement('a')
-      link.href = URL.createObjectURL(await response.blob())
+      const url = URL.createObjectURL(await response.blob())
+      link.href = url
       link.download = 'smart-slope-monitoring-report.pdf'
-      link.click(); URL.revokeObjectURL(link.href)
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
       setToast('Your engineering summary PDF has been downloaded.')
       return
     } catch {
@@ -266,9 +274,11 @@ function App() {
     }
     const report = `SMART SLOPE STABILITY MONITORING\n\nProject: Himalayan Field Study\nGenerated: ${new Date().toLocaleString()}\nCurrent factor of safety: ${fos.toFixed(2)}\nStability category: ${condition}\nModel-based risk estimate: ${risk}%\n\nSensor summary\n${sensors.map((sensor) => `${sensor.name}: ${sensor.value} ${sensor.unit}`).join('\n')}\n\nInterpretation\n${condition === 'SAFE' ? 'Current monitoring indicators are within the configured safe range.' : 'Monitoring indicators warrant review by a qualified geotechnical engineer.'}\n\nLimitations\nAcademic demonstration model. Not a substitute for site-specific geotechnical design.`
     const link = document.createElement('a')
-    link.href = URL.createObjectURL(new Blob([report], { type: 'text/plain' }))
+    const url = URL.createObjectURL(new Blob([report], { type: 'text/plain' }))
+    link.href = url
     link.download = 'smart-slope-monitoring-report.txt'
-    link.click(); URL.revokeObjectURL(link.href)
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
     setToast('Your monitoring summary has been downloaded.')
   }
 
@@ -287,14 +297,31 @@ function App() {
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={20} /></button><div className="breadcrumb"><span>Himalayan Field Study</span><span className="crumb-separator">/</span><strong>{headerTitle}</strong></div><div className="topbar-right"><div className="live-status"><span className={apiOnline ? 'pulse-dot' : 'muted-dot'} />{apiOnline ? 'Live monitoring' : 'Demo monitoring'}</div><span className="top-divider" /><span className="updated-label">Updated <strong>10:42 AM</strong></span><button className="icon-button notification-button" onClick={() => goTo('Alerts')} aria-label="Open alerts"><Bell size={18} /><i /></button><button className="icon-button" onClick={() => goTo('Settings')} aria-label="Open settings"><Settings size={18} /></button></div></header>
       <div className="page-content">
         <div className="page-heading"><div>{page !== 'Home' && <div className="eyebrow">AI + IoT + GEOTECHNICAL ENGINEERING</div>}<h1>{page === 'Home' ? 'SLOPE STABILITY MONITORING' : page === 'Predictions' ? 'Predicted slope condition' : page}</h1>{page === 'Home' ? <><p>AI + IoT + Geotechnical Engineering</p><p className="developer-credit">Developed by Ch. Jagadeesh</p></> : <p>{descriptions[page]}</p>}</div>{page === 'Home' && <div className="heading-date"><span>THURSDAY, OCTOBER 08</span><strong><span className={apiOnline ? 'pulse-dot' : 'muted-dot'} />{apiOnline ? 'All systems operational' : 'Demonstration data in use'}</strong></div>}</div>
-        {page === 'Home' && <HomePage fos={fos} risk={risk} condition={condition} sensors={sensors} demoData={demoData} setSelectedSensor={setSelectedSensor} setPage={goTo} mapStyle={mapStyle} setMapStyle={setMapStyle} />}
+        {page === 'Home' && <HomePage fos={fos} risk={risk} condition={condition} sensors={sensors} demoData={demoData} setSelectedSensor={setSelectedSensor} setPage={goTo} mapStyle={mapStyle} setMapStyle={setMapStyle} predictionLocations={predictionLocations} selectedMapLocation={selectedMapLocation} setSelectedMapLocation={setSelectedMapLocation} />}
         {page === 'Live Monitoring' && <LivePage running={running} setRunning={setRunning} scenario={scenario} setScenario={setScenario} sensors={sensors} fos={fos} risk={risk} tick={tick} onReset={resetSimulation} onSelectSensor={setSelectedSensor} />}
         {page === 'Slope Analysis' && <AnalysisPage fos={fos} condition={condition} inputs={inputs} setInputs={setInputs} calculation={calculation} onRecalculate={recalculate} />}
-        {page === 'Predictions' && <PredictionPage fos={fos} />}
+        {page === 'Predictions' && <MlPredictionPage />}
         {page === 'History' && <HistoryPage />}
         {page === 'Sensors' && <SensorPage sensors={sensors} onSelectSensor={setSelectedSensor} onRefresh={refreshSensors} />}
         {page === 'Alerts' && <AlertsPage condition={condition} risk={risk} />}
-        {page === 'Data Upload' && <UploadPage fileResult={fileResult} onFile={readCsv} onAnalyze={analyzeCsv} uploading={uploading} />}
+        {page === 'Data Upload' && <DataUploadPage onPredictions={(rows) => {
+          const points = rows.flatMap((row, index) => {
+            if (row.prediction_status !== 'predicted') return []
+            const latitude = Number(getPredictionField(row, 'latitude'))
+            const longitude = Number(getPredictionField(row, 'longitude'))
+            const fosValue = Number(row.predicted_factor_of_safety)
+            if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !Number.isFinite(fosValue) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return []
+            return [{
+              latitude,
+              longitude,
+              fos: fosValue,
+              riskClass: String(row.predicted_risk_class ?? 'Unknown'),
+              warning: String(row.predicted_warning_level ?? 'Unknown'),
+              row: index + 1,
+            }]
+          })
+          setPredictionLocations(points)
+        }} />}
         {page === 'AI Model' && <AiPage />}
         {page === 'Reports' && <ReportsPage onExport={exportReport} fos={fos} risk={risk} condition={condition} />}
         {page === 'Settings' && <SettingsPage frequency={frequency} setFrequency={setFrequency} />}
@@ -306,7 +333,7 @@ function App() {
   </div>
 }
 
-function HomePage({ fos, risk, condition, sensors, demoData, setSelectedSensor, setPage, mapStyle, setMapStyle }: { fos: number; risk: number; condition: string; sensors: Sensor[]; demoData: boolean; setSelectedSensor: (name: string) => void; setPage: (page: Page) => void; mapStyle: 'Standard' | 'Terrain' | 'Satellite'; setMapStyle: (style: 'Standard' | 'Terrain' | 'Satellite') => void }) {
+function HomePage({ fos, risk, condition, sensors, demoData, setSelectedSensor, setPage, mapStyle, setMapStyle, predictionLocations, selectedMapLocation, setSelectedMapLocation }: { fos: number; risk: number; condition: string; sensors: Sensor[]; demoData: boolean; setSelectedSensor: (name: string) => void; setPage: (page: Page) => void; mapStyle: 'Standard' | 'Terrain' | 'Satellite'; setMapStyle: (style: 'Standard' | 'Terrain' | 'Satellite') => void; predictionLocations: PredictionLocation[]; selectedMapLocation: SelectedMapLocation | null; setSelectedMapLocation: (location: SelectedMapLocation) => void }) {
   const stabilityIndex = Math.min(0.99, fos / 3.2)
   const indexStatus = stabilityIndex >= 0.75 ? 'STABLE' : stabilityIndex >= 0.5 ? 'DECLINING' : 'LOW'
   return <>
@@ -318,9 +345,15 @@ function HomePage({ fos, risk, condition, sensors, demoData, setSelectedSensor, 
     </section>
     <section className="overview-grid">
       <div className="panel slope-panel"><div className="panel-heading"><div><h2>Slope condition</h2><p>Live view of the monitored slope and sensor locations</p></div><button className="text-button" onClick={() => setPage('Live Monitoring')}>View live <ArrowRight size={15} /></button></div><div className="visual-wrap"><SlopeDrawing condition={condition} /><div className="diagram-caption"><span><i className="legend-dot sensor-legend" />Monitoring point</span><span><i className="legend-line" />Groundwater level</span><span><i className="legend-arrow">↑</i>Movement direction</span></div></div><div className="slope-bottom"><div><small>SLOPE SITE</small><strong>Himalayan Field Study <span className="coordinate">27.7172° N, 85.3240° E</span></strong></div><span className={`condition-pill ${condition.toLowerCase()}`}><i />{condition}</span></div></div>
-      <div className="panel map-panel"><div className="panel-heading"><div><h2>Monitoring locations</h2><p>5 active points across the study area</p></div><button className="icon-button subtle-button" aria-label="Map options"><SlidersHorizontal size={16} /></button></div><div className="map-frame"><MapContainer center={[27.7172, 85.324]} zoom={14} scrollWheelZoom={false} zoomControl={true}>
+      <div className="panel map-panel"><div className="panel-heading"><div><h2>Monitoring locations</h2><p>5 sensors{predictionLocations.length ? ` · ${predictionLocations.length} CSV prediction locations` : ''}</p></div><button className="icon-button subtle-button" aria-label="Map options"><SlidersHorizontal size={16} /></button></div><div className="map-frame"><MapContainer center={[27.7172, 85.324]} zoom={14} scrollWheelZoom={false} zoomControl={true}>
+        <MapLocationSelector onSelect={setSelectedMapLocation} />
+        {predictionLocations.length > 0 && <PredictionMapBounds locations={predictionLocations} />}
         <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url={mapStyle === 'Satellite' ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}' : mapStyle === 'Terrain' ? 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png' : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'} />
-        {sensorLocations.map(([name, lat, lng, value, color]) => <Circle key={name} center={[lat, lng]} radius={48} pathOptions={{ color, fillColor: color, fillOpacity: 0.78, weight: 2 }} eventHandlers={{ click: () => setSelectedSensor(name === 'Piezometer' ? 'Pore pressure' : name === 'GNSS station' ? 'GNSS displacement' : name === 'Inclinometer' ? 'Slope movement' : name === 'Rain gauge' ? 'Rainfall' : 'Soil moisture') }}><MapTooltip direction="top"><strong>{name}</strong><br />{value}<br /><small>Click for sensor details</small></MapTooltip></Circle>)}</MapContainer><div className="map-style-control">{(['Standard', 'Terrain', 'Satellite'] as const).map((style) => <button key={style} className={mapStyle === style ? 'selected' : ''} onClick={() => setMapStyle(style)}>{style}</button>)}</div></div><div className="map-foot"><span><i className="pulse-dot" /> 5 of 5 sensors reporting</span><span>OpenStreetMap</span></div></div>
+        {sensorLocations.map(([name, lat, lng, value, color]) => <Circle key={name} center={[lat, lng]} radius={48} pathOptions={{ color, fillColor: color, fillOpacity: 0.78, weight: 2 }} eventHandlers={{ click: () => setSelectedSensor(name === 'Piezometer' ? 'Pore pressure' : name === 'GNSS station' ? 'GNSS displacement' : name === 'Inclinometer' ? 'Slope movement' : name === 'Rain gauge' ? 'Rainfall' : 'Soil moisture') }}><MapTooltip direction="top"><strong>{name}</strong><br />{value}<br /><small>Click for sensor details</small></MapTooltip></Circle>)}
+        {predictionLocations.map((location) => <CircleMarker key={`prediction-${location.row}`} center={[location.latitude, location.longitude]} radius={6} pathOptions={{ color: location.warning === 'RED' ? '#d9534f' : location.warning === 'ORANGE' ? '#d9783d' : location.warning === 'YELLOW' ? '#d99a2b' : '#4e9f6e', fillOpacity: 0.85, weight: 1 }}><MapTooltip direction="top"><strong>CSV prediction · row {location.row}</strong><br />FoS: {location.fos.toFixed(3)}<br />{location.riskClass} · {location.warning}</MapTooltip></CircleMarker>)}
+        {selectedMapLocation && <CircleMarker center={[selectedMapLocation.latitude, selectedMapLocation.longitude]} radius={8} pathOptions={{ color: '#bd5548', fillColor: '#ffffff', fillOpacity: 1, weight: 3 }}><MapTooltip direction="top"><strong>Selected location</strong><br />{selectedMapLocation.latitude.toFixed(6)}, {selectedMapLocation.longitude.toFixed(6)}</MapTooltip></CircleMarker>}
+      </MapContainer><div className="map-style-control">{(['Standard', 'Terrain', 'Satellite'] as const).map((style) => <button key={style} className={mapStyle === style ? 'selected' : ''} onClick={() => setMapStyle(style)}>{style}</button>)}</div></div><div className="map-foot"><span><i className="pulse-dot" /> 5 sensor points{predictionLocations.length ? ` · ${predictionLocations.length} predictions` : ''}</span><span>{predictionLocations.length ? 'Input coordinates only' : 'OpenStreetMap'}</span></div>
+      <div className="map-soil-status" role="status" aria-live="polite">{selectedMapLocation ? `No real soil data available at ${selectedMapLocation.latitude.toFixed(6)}, ${selectedMapLocation.longitude.toFixed(6)}. No coordinate-linked soil dataset is configured; the model training data has no geographic coordinates.` : 'No coordinate-linked soil dataset is configured. Click the map to check data availability for a location.'}</div></div>
     </section>
     <section className="sensor-section"><div className="section-heading"><div><h2>Monitoring data</h2><p>Latest readings from across the slope</p></div><div className="section-actions">{demoData && <span className="demo-tag"><span /> DEMO SENSOR DATA</span>}<button className="text-button" onClick={() => setPage('Sensors')}>All sensors <ArrowRight size={15} /></button></div></div><div className="sensor-grid">{sensors.map((sensor) => <SensorCard key={sensor.name} sensor={sensor} onClick={() => setSelectedSensor(sensor.name)} />)}</div></section>
     <section className="bottom-grid"><div className="panel chart-panel"><div className="panel-heading"><div><h2>Stability through today</h2><p>Observed factor of safety and rainfall response</p></div><span className="chart-key"><i className="key-line" />Factor of safety</span></div><div className="chart-holder"><ResponsiveContainer width="100%" height="100%"><ComposedChart data={historyData} margin={{ top: 10, right: 8, left: -15, bottom: 0 }}><CartesianGrid stroke="#eaf0ee" vertical={false} /><XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: '#8a9697', fontSize: 11 }} /><YAxis yAxisId="fos" domain={[2.7, 3.3]} axisLine={false} tickLine={false} tick={{ fill: '#8a9697', fontSize: 11 }} /><YAxis yAxisId="rain" orientation="right" hide domain={[0, 60]} /><Tooltip contentStyle={{ borderRadius: 8, border: '1px solid #dce5e2', fontSize: 12 }} /><Area yAxisId="rain" dataKey="rain" fill="#dceeed" stroke="#dceeed" name="Rainfall (mm)" /><Line yAxisId="fos" dataKey="fos" stroke="#145a8d" strokeWidth={2.5} dot={{ r: 3, fill: '#145a8d', strokeWidth: 0 }} activeDot={{ r: 5 }} name="Factor of safety" /></ComposedChart></ResponsiveContainer></div></div><div className="panel insight-panel"><div className="insight-icon"><Wind size={19} /></div><div className="eyebrow">ENGINEER'S NOTE</div><h3>Everything looks stable right now.</h3><p>Rainfall has increased over the last 6 hours. Pore pressure is also gradually rising, while movement remains within the configured monitoring range.</p><button className="text-button" onClick={() => setPage('Predictions')}>See what may happen next <ArrowRight size={15} /></button></div></section>
@@ -365,7 +398,7 @@ function EngineeringScale({ fos }: { fos: number }) {
   return <div className="engineering-scale"><div className="scale-track"><span className="scale-critical" /><span className="scale-warning" /><span className="scale-caution" /><span className="scale-safe" /><i className="scale-marker" style={{ left: position }} /></div><div className="scale-labels"><span>CRITICAL<br />&lt; 1.0</span><span>WARNING<br />1.0 – 1.19</span><span>CAUTION<br />1.2 – 1.49</span><span>SAFE<br />≥ 1.5</span></div></div>
 }
 
-function PredictionPage({ fos }: { fos: number }) {
+export function LegacyDemonstrationPredictionPage({ fos }: { fos: number }) {
   return <><div className="demo-banner prediction-banner"><span className="demo-tag"><BrainCircuit size={13} /> DEMO PREDICTION MODE</span><span>Demonstration estimate — not generated from a trained LSTM model.</span></div><div className="prediction-summary"><div className="panel prediction-stat"><span>Current factor of safety</span><strong>{fos.toFixed(2)}</strong><small>Latest calculated condition</small></div><div className="prediction-arrow"><ArrowRight size={22} /></div><div className="panel prediction-stat estimate-stat"><span>Predicted in 4 days</span><strong>{Math.max(.8, fos - .23).toFixed(2)}</strong><small>Demonstration time-series estimate</small></div><div className="panel prediction-change"><span>EXPECTED CHANGE</span><strong><ArrowDownRight size={17} /> −0.23</strong><small>Slight deterioration</small></div></div><div className="panel prediction-chart-panel"><div className="panel-heading"><div><h2>Historical stability vs predicted stability</h2><p>Observed measurements are solid; estimates are shown as a dashed line.</p></div><div className="prediction-legend"><span><i className="key-line" />Observed</span><span><i className="key-line dashed-key" />Predicted</span></div></div><div className="chart-holder prediction-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={predictionData} margin={{ top: 16, right: 15, left: -15, bottom: 0 }}><CartesianGrid stroke="#eaf0ee" vertical={false} /><XAxis dataKey="day" axisLine={false} tickLine={false} tick={{ fill: '#8a9697', fontSize: 11 }} /><YAxis domain={[2.4, 3.35]} axisLine={false} tickLine={false} tick={{ fill: '#8a9697', fontSize: 11 }} /><Tooltip /><ReferenceLine x="Oct 08" stroke="#aebcb8" strokeDasharray="3 4" label={{ value: 'NOW', fill: '#778783', fontSize: 10, position: 'insideTopRight' }} /><Line dataKey="observed" name="Observed FOS" connectNulls stroke="#145a8d" strokeWidth={2.5} dot={{ r: 3 }} /><Line dataKey="predicted" name="Predicted FOS" connectNulls stroke="#159a9c" strokeWidth={2.5} strokeDasharray="7 5" dot={{ r: 3, fill: '#fff', strokeWidth: 2 }} /></LineChart></ResponsiveContainer></div></div><div className="prediction-explain"><div className="panel explain-copy"><div className="eyebrow">A HUMAN-READABLE EXPLANATION</div><h2>How does the AI help?</h2><p>The LSTM model learns patterns from previous monitoring observations such as rainfall, pore pressure, soil moisture and slope movement. It uses these time-series patterns to estimate the future stability condition.</p><span className="demo-note">This screen currently uses a deterministic demonstration estimate. A trained model needs sufficient, quality-checked historical observations.</span></div><div className="panel flow-panel"><div className="flow-step"><div><Activity size={20} /></div><strong>Past observations</strong><small>Sensor time series</small></div><ArrowRight className="flow-arrow" size={19} /><div className="flow-step lstm-step"><div><BrainCircuit size={20} /></div><strong>LSTM</strong><small>Pattern learning</small></div><ArrowRight className="flow-arrow" size={19} /><div className="flow-step"><div><Gauge size={20} /></div><strong>Future estimate</strong><small>Next 4 days</small></div></div></div></>
 }
 
@@ -401,17 +434,21 @@ function TimelineItem({ time, title, description, tone, last }: { time: string; 
   return <div className={`timeline-item ${last ? 'last' : ''}`}><span className={`timeline-dot ${tone}`} /><span className="timeline-time">{time}</span><div><strong>{title}</strong><p>{description}</p></div></div>
 }
 
-function UploadPage({ fileResult, onFile, onAnalyze, uploading }: { fileResult: { name: string; records: number; missing: number; columns: string[]; error: string } | null; onFile: (file: File) => void; onAnalyze: () => void; uploading: boolean }) {
+export function LegacySensorCsvUploadPage({ fileResult, onFile, onAnalyze, uploading }: { fileResult: { name: string; records: number; missing: number; columns: string[]; error: string } | null; onFile: (file: File) => void; onAnalyze: () => void; uploading: boolean }) {
   const [dragging, setDragging] = useState(false)
   return <><div className="upload-layout"><div className="panel upload-panel"><div className="upload-heading-icon"><FileUp size={22} /></div><h2>Import monitoring data</h2><p>Upload historical sensor observations to analyse your slope.</p><label className={`dropzone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); if (event.dataTransfer.files[0]) void onFile(event.dataTransfer.files[0]) }}><input type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void onFile(file) }} /><span className="upload-cloud"><FileUp size={22} /></span><strong>Drop your CSV file here</strong><span>or <u>browse files</u> from your computer</span><small>CSV files only · Maximum 20 MB</small></label>{fileResult && <div className={`file-result ${fileResult.error ? 'file-error' : ''}`}><div className="file-result-head"><span><HardDrive size={17} />{fileResult.name}</span>{fileResult.error ? <AlertTriangle size={17} /> : <Check size={17} />}</div>{fileResult.error ? <p>{fileResult.error}</p> : <div className="validation-list"><span><Check size={14} />File received</span><span><Check size={14} />Columns detected ({fileResult.columns.length})</span><span><Check size={14} />Timestamp recognised</span><span><Check size={14} />Data quality checked</span></div>}</div>}{fileResult && !fileResult.error && <><div className="upload-stats"><div><small>RECORDS</small><strong>{fileResult.records.toLocaleString()}</strong></div><div><small>MISSING VALUES</small><strong>{fileResult.missing}</strong></div><div><small>DATA QUALITY</small><strong>{fileResult.records ? `${Math.max(0, 100 - fileResult.missing / fileResult.records * 100).toFixed(1)}%` : '—'}</strong></div></div><button className="primary-button analyze-data" onClick={onAnalyze} disabled={uploading}><Activity size={16} />{uploading ? 'Processing monitoring data…' : 'Analyse data'}</button></>}</div><div className="upload-guide"><div className="eyebrow">CSV FORMAT</div><h3>Columns we look for</h3><p>Use one row per observation and include these exact column names. Units should match the labels.</p><div className="csv-columns">{['timestamp', 'rainfall_mm', 'soil_moisture', 'pore_pressure_kpa', 'slope_movement_mm_day', 'gnss_displacement_mm', 'inclinometer_deg', 'groundwater_head_m'].map((name) => <code key={name}>{name}</code>)}</div><button className="text-button download-template" onClick={() => { const csv = `timestamp,${['rainfall_mm', 'soil_moisture', 'pore_pressure_kpa', 'slope_movement_mm_day', 'gnss_displacement_mm', 'inclinometer_deg', 'groundwater_head_m'].join(',')}\n2026-10-08T10:00:00,12.5,74.5,52,0.8,2.1,0.04,7.4`; const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); link.download = 'monitoring-template.csv'; link.click(); URL.revokeObjectURL(link.href) }}><Download size={15} />Download CSV template</button></div></div></>
 }
 
+export function LegacyLstmDemoPage() {
+  return <><div className="ai-hero panel"><div className="ai-hero-icon"><BrainCircuit size={24} /></div><div><div className="eyebrow">TIME-SERIES MODEL</div><h2>Long Short-Term Memory (LSTM)</h2><p>Sequence learning for monitoring trends, with transparent limits on what the estimate means.</p></div><span className="demo-tag"><span /> NOT USED FOR PREDICTIONS</span></div><div className="ai-grid"><div className="panel ai-detail"><h3>What the model would learn</h3><p>An LSTM would need validated, time-ordered site observations. No such history is provided by the current slope-stability CSV.</p><div className="feature-list">{['Rainfall', 'Soil moisture', 'Pore pressure', 'Slope movement', 'GNSS displacement', 'Inclinometer', 'Groundwater'].map((item) => <span key={item}><Check size={14} />{item}</span>)}</div></div><div className="panel model-config"><h3>Model configuration</h3><div className="calculation-line"><span>Input sequence</span><b>7 previous observations</b></div><div className="calculation-line"><span>Prediction horizon</span><b>Not configured</b></div><div className="calculation-line"><span>Training status</span><b>Not trained</b></div><div className="calculation-line"><span>MAE / RMSE</span><b>Unavailable</b></div><p className="demo-note">The current prediction view uses the fitted tabular regression/classification pipelines only when their artifacts are present. This LSTM module is inactive and produces no prediction.</p></div></div><div className="panel model-flow"><div className="eyebrow">MODEL WORKFLOW</div><div className="flow-diagram"><span>Past 7 observations</span><ArrowRight size={16} /><span>Normalise features</span><ArrowRight size={16} /><span className="flow-highlight">LSTM sequence model</span><ArrowRight size={16} /><span>Future FOS estimate</span></div></div></>
+}
+
 function AiPage() {
-  return <><div className="ai-hero panel"><div className="ai-hero-icon"><BrainCircuit size={24} /></div><div><div className="eyebrow">TIME-SERIES MODEL</div><h2>Long Short-Term Memory (LSTM)</h2><p>Sequence learning for monitoring trends, with transparent limits on what the estimate means.</p></div><span className="demo-tag"><span /> DEMONSTRATION MODE</span></div><div className="ai-grid"><div className="panel ai-detail"><h3>What the model learns</h3><p>An LSTM can learn how combinations of rainfall, pore pressure, soil moisture and movement have changed before. A sequence of past observations is used to estimate a future stability indicator.</p><div className="feature-list">{['Rainfall', 'Soil moisture', 'Pore pressure', 'Slope movement', 'GNSS displacement', 'Inclinometer', 'Groundwater'].map((item) => <span key={item}><Check size={14} />{item}</span>)}</div></div><div className="panel model-config"><h3>Model configuration</h3><div className="calculation-line"><span>Input sequence</span><b>7 previous observations</b></div><div className="calculation-line"><span>Prediction horizon</span><b>4 days</b></div><div className="calculation-line"><span>Training status</span><b>Not trained</b></div><div className="calculation-line"><span>MAE / RMSE</span><b>Unavailable</b></div><p className="demo-note">A trained model requires sufficient, validated site observations. The current prediction view uses a deterministic demonstration estimate and does not report fabricated training metrics.</p></div></div><div className="panel model-flow"><div className="eyebrow">MODEL WORKFLOW</div><div className="flow-diagram"><span>Past 7 observations</span><ArrowRight size={16} /><span>Normalise features</span><ArrowRight size={16} /><span className="flow-highlight">LSTM sequence model</span><ArrowRight size={16} /><span>Future FOS estimate</span></div></div></>
+  return <><div className="ai-hero panel"><div className="ai-hero-icon"><BrainCircuit size={24} /></div><div><div className="eyebrow">SUPERVISED TABULAR MODELS</div><h2>Random Forest and linear baselines</h2><p>Validation-selected regression and classification pipelines are evaluated once on a held-out test split.</p></div><span className="demo-tag"><span /> USER DATA · UNVERIFIED SOURCE</span></div><div className="ai-grid"><div className="panel ai-detail"><h3>Dataset-supported model inputs</h3><p>Only the seven features present in the supplied CSV are used. The redundant numeric reinforcement encoding is excluded.</p><div className="feature-list">{['Unit weight · kN/m³', 'Cohesion · kPa', 'Friction angle · degrees', 'Slope angle · degrees', 'Slope height · m', 'Pore-water pressure ratio · 0–1', 'Reinforcement type · category'].map((item) => <span key={item}><Check size={14} />{item}</span>)}</div></div><div className="panel model-config"><h3>Preprocessing and output</h3><div className="calculation-line"><span>Missing training features</span><b>Imputed inside fitted pipeline</b></div><div className="calculation-line"><span>Invalid manual / CSV values</span><b>Rejected with explicit errors</b></div><div className="calculation-line"><span>Regression target</span><b>Observed Factor of Safety (FS)</b></div><div className="calculation-line"><span>Classification rule</span><b>UNSTABLE &lt; 1.0; STABLE otherwise</b></div><p className="demo-note">Dataset source and licence are unverified. Scores describe only the supplied CSV; independent field validation is required before any real-world interpretation.</p></div></div><ModelEvaluationPage /></>
 }
 
 function ReportsPage({ onExport, fos, risk, condition }: { onExport: () => void; fos: number; risk: number; condition: string }) {
-  return <><div className="report-layout"><div className="panel report-preview"><div className="report-preview-top"><div className="brand-mark"><Mountain size={18} /></div><span>ENGINEERING SUMMARY · 08 OCT 2026</span></div><div className="eyebrow">HIMALAYAN FIELD STUDY</div><h2>Monitoring condition report</h2><p className="report-intro">A summary of the observed slope condition and available monitoring information.</p><div className="report-metrics"><div><span>FACTOR OF SAFETY</span><strong>{fos.toFixed(2)}</strong></div><div><span>CURRENT RISK</span><strong>{risk}%</strong></div><div><span>CONDITION</span><strong className="condition-text">{condition}</strong></div></div><h3>Engineering interpretation</h3><p>Current monitoring indicators suggest a {condition.toLowerCase()} condition. Rainfall and pore pressure trends should be interpreted alongside the site-specific geotechnical model and reviewed by a qualified engineer.</p><h3>Limitations</h3><p>Academic demonstration model. Not a substitute for site-specific geotechnical design, field inspection or professional engineering judgement.</p></div><div className="report-options"><div className="eyebrow">REPORT CONTENTS</div><h3>Included in your export</h3>{['Project information', 'Sensor summary', 'Current condition & FOS', 'Risk estimate', 'Engineering interpretation', 'Limitations & disclaimer'].map((item) => <div key={item} className="report-check"><Check size={15} />{item}</div>)}<button className="primary-button" onClick={onExport}><Download size={16} />Download report</button><small>Exports a plain-text project summary. PDF export can be added when a PDF rendering service is configured.</small></div></div><div className="disclaimer report-disclaimer"><TriangleAlert size={15} />This report is for academic demonstration and review purposes only.</div></>
+  return <><div className="report-layout"><div className="panel report-preview"><div className="report-preview-top"><div className="brand-mark"><Mountain size={18} /></div><span>ENGINEERING SUMMARY · 08 OCT 2026</span></div><div className="eyebrow">HIMALAYAN FIELD STUDY</div><h2>Monitoring condition report</h2><p className="report-intro">A summary of the reported slope condition and available monitoring information.</p><div className="report-metrics"><div><span>FACTOR OF SAFETY</span><strong>{fos.toFixed(2)}</strong></div><div><span>CURRENT RISK</span><strong>{risk}%</strong></div><div><span>CONDITION</span><strong className="condition-text">{condition}</strong></div></div><h3>Engineering interpretation</h3><p>Current monitoring indicators suggest a {condition.toLowerCase()} condition. Rainfall and pore pressure trends should be interpreted alongside the site-specific geotechnical model and reviewed by a qualified engineer.</p><h3>Limitations</h3><p>Academic demonstration model. Not a substitute for site-specific geotechnical design, field inspection or professional engineering judgement.</p></div><div className="report-options"><div className="eyebrow">REPORT CONTENTS</div><h3>Included in your export</h3>{['Project information', 'Sensor summary', 'Current condition & FOS', 'Risk estimate', 'Engineering interpretation', 'Limitations & disclaimer'].map((item) => <div key={item} className="report-check"><Check size={15} />{item}</div>)}<button className="primary-button" onClick={onExport}><Download size={16} />Download report</button><small>Downloads a server-generated PDF when FastAPI is connected; falls back to a plain-text summary if PDF export is unavailable.</small></div></div><div className="disclaimer report-disclaimer"><TriangleAlert size={15} />This report is for academic demonstration and review purposes only.</div></>
 }
 
 function SettingsPage({ frequency, setFrequency }: { frequency: string; setFrequency: (value: string) => void }) {

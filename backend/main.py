@@ -1,24 +1,47 @@
+import json
+import os
 from datetime import datetime, timezone
 from io import StringIO
+from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
 
 from .database import Base, SessionLocal, engine
 from .engineering.factor_of_safety import StabilityInput, calculate_factor_of_safety
-from .models import Alert, FosResult, GeotechnicalParameters, ModelRun, Prediction, Sensor, SensorReading, Slope
+from .ml.prediction import (
+    ARTIFACT_DIR,
+    EVALUATION_PATH,
+    FEATURES,
+    OUTPUT_COLUMNS,
+    PredictionInputError,
+    load_trained_models,
+    normalize_column_name,
+    parse_prediction_csv,
+    predict_manual,
+    predict_rows,
+)
+from .models import Alert, FosResult, GeotechnicalParameters, MLPrediction, Sensor, SensorReading, Slope
 from .reporting import build_pdf_report
 
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Smart Slope Stability Monitoring API", version="1.0.0")
+allowed_origins = {
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,https://chippadajagadeesh211-max.github.io",
+    ).split(",")
+    if origin.strip()
+}
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=sorted(allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,6 +85,10 @@ class SimulationRequest(BaseModel):
     step: int = Field(ge=0, le=10000)
 
 
+class ManualPredictionRequest(BaseModel):
+    features: dict[str, Any]
+
+
 def ensure_default_slope(session):
     slope = session.query(Slope).filter_by(id=1).first()
     if not slope:
@@ -100,9 +127,179 @@ def session_scope():
         raise
 
 
+@app.on_event("startup")
+def initialize_default_slope():
+    session = session_scope()
+    session.close()
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "smart-slope-api", "database": "sqlite"}
+
+
+@app.get("/api/ml/model-info")
+def ml_model_info():
+    if not (ARTIFACT_DIR / "trained_models.joblib").is_file():
+        return {
+            "ready": False,
+            "message": "Trained model artifacts are missing. Run `python -m backend.ml.train --dataset data/slope_stability.csv` before starting predictions.",
+            "feature_names": FEATURES,
+        }
+    try:
+        load_trained_models()
+        report = json.loads(EVALUATION_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "ready": False,
+            "message": "The model evaluation report is missing. Retrain the models to regenerate all artifacts.",
+            "feature_names": FEATURES,
+        }
+    return {
+        "ready": True,
+        "message": "Trained models are ready.",
+        "feature_names": FEATURES,
+        "output_columns": OUTPUT_COLUMNS,
+        "selected_models": report["selected_models"],
+        "model_version": report["model_version"],
+        "feature_schema": report["feature_schema"],
+        "target_definition": report["target_definition"],
+        "report": report,
+    }
+
+
+def save_ml_prediction(
+    features: dict[str, Any],
+    result: dict[str, Any],
+    scenario: str,
+) -> str:
+    session = SessionLocal()
+    try:
+        record = MLPrediction(
+            scenario=scenario,
+            input_parameters=json.dumps(features, allow_nan=False),
+            predicted_fos=result["predicted_factor_of_safety"],
+            predicted_risk_class=result["predicted_risk_class"],
+            model_version=result["model_version"],
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record.created_at.isoformat() + "Z"
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@app.get("/api/ml/history")
+def ml_prediction_history(limit: int = Query(default=50, ge=1, le=200)):
+    session = SessionLocal()
+    try:
+        entries = (
+            session.query(MLPrediction)
+            .order_by(MLPrediction.created_at.desc(), MLPrediction.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": item.id,
+                "scenario": item.scenario,
+                "input_parameters": json.loads(item.input_parameters),
+                "predicted_factor_of_safety": item.predicted_fos,
+                "predicted_risk_class": item.predicted_risk_class,
+                "model_version": item.model_version,
+                "created_at": item.created_at.isoformat() + "Z",
+                "record_type": "model prediction; not a field observation",
+            }
+            for item in entries
+        ]
+    finally:
+        session.close()
+
+
+@app.post("/api/ml/predict/csv")
+async def predict_csv(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please choose a CSV file.")
+    contents = await file.read(20 * 1024 * 1024 + 1)
+    if len(contents) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV files must be 20 MB or smaller.")
+    try:
+        frame, original_columns = parse_prediction_csv(contents)
+    except PredictionInputError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    try:
+        models = load_trained_models()
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    result = predict_rows(frame, original_columns, models)
+    if result["predicted_rows"]:
+        session = SessionLocal()
+        try:
+            source_rows = frame.to_dict(orient="records")
+            for index, (source_row, prediction) in enumerate(zip(
+                source_rows, result["rows"], strict=True
+            )):
+                if prediction["prediction_status"] != "predicted":
+                    continue
+                normalized = {
+                    normalize_column_name(str(key)): value
+                    for key, value in source_row.items()
+                }
+                input_parameters = {
+                    feature: (
+                        str(normalized[feature])
+                        if feature == "reinforcement_type"
+                        else float(normalized[feature])
+                    )
+                    for feature in FEATURES
+                }
+                session.add(MLPrediction(
+                    scenario=f"CSV row {index + 1}",
+                    input_parameters=json.dumps(input_parameters, allow_nan=False),
+                    predicted_fos=prediction["predicted_factor_of_safety"],
+                    predicted_risk_class=prediction["predicted_risk_class"],
+                    model_version=models.get("model_version", "unknown"),
+                ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+    return result
+
+
+@app.post("/api/ml/predict/manual")
+def predict_manual_input(request: ManualPredictionRequest):
+    try:
+        models = load_trained_models()
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    try:
+        result = predict_manual(request.features, models)
+    except PredictionInputError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    normalized = {
+        normalize_column_name(key): value for key, value in request.features.items()
+    }
+    input_parameters = {
+        feature: (
+            str(normalized[feature])
+            if feature == "reinforcement_type"
+            else float(normalized[feature])
+        )
+        for feature in FEATURES
+    }
+    result["prediction_timestamp"] = save_ml_prediction(
+        input_parameters,
+        result,
+        "Manual scenario",
+    )
+    return result
 
 
 @app.get("/api/dashboard")
@@ -203,46 +400,18 @@ def simulate(request: SimulationRequest):
 
 @app.get("/api/predictions")
 def predictions():
-    session = session_scope()
-    try:
-        latest = session.query(FosResult).order_by(FosResult.id.desc()).first()
-        current = latest.fos if latest else 2.91
-        estimate = round(max(0.6, current - 0.23), 2)
-        session.add(Prediction(predicted_fos=estimate, mode="DEMO"))
-        session.commit()
-        return {
-            "mode": "DEMO",
-            "current_fos": round(current, 2),
-            "predicted_fos": estimate,
-            "change": round(estimate - current, 2),
-            "label": "Demonstration estimate — not generated from a trained LSTM model.",
-        }
-    finally:
-        session.close()
+    raise HTTPException(
+        status_code=503,
+        detail="The legacy demo prediction endpoint is disabled. Train and use the tabular model at /api/ml/predict/manual.",
+    )
 
 
 @app.post("/api/predictions/train")
 async def train_prediction_model(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Please choose a CSV file.")
-    try:
-        frame = pd.read_csv(StringIO((await file.read()).decode("utf-8-sig")))
-        from .ml.lstm_model import predict_stability
-
-        result = predict_stability(frame)
-    except (UnicodeDecodeError, pd.errors.ParserError) as error:
-        raise HTTPException(status_code=400, detail="We couldn't read this CSV. Check its delimiter and encoding, then try again.") from error
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-
-    session = session_scope()
-    try:
-        session.add(Prediction(predicted_fos=result.predicted_fos or 2.68, mode=result.mode))
-        session.add(ModelRun(mode=result.mode, mae=result.mae, rmse=result.rmse))
-        session.commit()
-    finally:
-        session.close()
-    return result.__dict__
+    raise HTTPException(
+        status_code=410,
+        detail="On-request LSTM training is disabled. Train the validated tabular pipelines offline with `python -m backend.ml.train --dataset data/slope_stability.csv`.",
+    )
 
 
 @app.get("/api/alerts")

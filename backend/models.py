@@ -82,3 +82,14 @@ class ModelRun(Base):
     mae: Mapped[float | None] = mapped_column(Float, nullable=True)
     rmse: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MLPrediction(Base):
+    __tablename__ = "ml_predictions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scenario: Mapped[str] = mapped_column(String(120), default="Manual scenario")
+    input_parameters: Mapped[str] = mapped_column(Text)
+    predicted_fos: Mapped[float] = mapped_column(Float)
+    predicted_risk_class: Mapped[str] = mapped_column(String(20))
+    model_version: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
